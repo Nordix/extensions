@@ -49,7 +49,7 @@ REQUIRED_WAKEUP_PROPERTIES = {
     'wakeup_ssh_key': "SSH key for the wakeup session."
 }
 
-cfg.register_opts(opts, group='wakeup')
+CONF.register_opts(opts, group='wakeup')
 
 class SSHWakeup(base.BootInterface):
 
