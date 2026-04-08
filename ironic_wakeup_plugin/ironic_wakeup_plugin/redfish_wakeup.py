@@ -28,4 +28,4 @@ class RedfishWakeupHardware(redfish.RedfishHardware):
     @property
     def supported_power_interfaces(self):
         """List of supported power interfaces."""
-        return (super().supported_boot_interfaces + [fake.FakePower])
+        return (super().supported_power_interfaces + [fake.FakePower])

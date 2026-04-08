@@ -36,7 +36,11 @@ opts = [
     cfg.StrOpt('wakeup_target_dir',
                default='/opt/ipa-wakeup',
                help=_('Path to the directory containing IPA '
-                      'files on the target node.'))
+                      'files on the target node.')),
+    cfg.StrOpt('wakeup_tmp_dir',
+               default='/data/tmp/ipa-wakeup',
+               help=_('Path to the directory containing temporary files'
+                      'used by the plugin on the ironic host.')),
 ]
 
 REQUIRED_WAKEUP_PROPERTIES = {
@@ -45,10 +49,7 @@ REQUIRED_WAKEUP_PROPERTIES = {
     'wakeup_ssh_key': "SSH key for the wakeup session."
 }
 
-
-def register_opts(conf):
-    conf.register_opts(opts, group='wakeup')
-
+cfg.register_opts(opts, group='wakeup')
 
 class SSHWakeup(base.BootInterface):
 
@@ -81,7 +82,7 @@ class SSHWakeup(base.BootInterface):
         full_kern_args = kernel_params
         for key, value in agent_options.items():
             full_kern_args = full_kern_args + f" {key}={value}"
-        key_file = '/tmp/' + task.node.uuid + '.priv'
+        key_file = CONF.wakeup.wakeup_tmp_dir + '/' + task.node.uuid + '.priv'
         with open(key_file, 'w') as f:
             f.write(ssh_key)
             f.write("\n")
@@ -89,9 +90,10 @@ class SSHWakeup(base.BootInterface):
         # token = manager_utils.add_secret_token(task.node, pregenerated=True)
         LOG.debug('Initiate wakeup for user:%s address:%s kernel-args: [ %s ]',
                   ssh_user, ssh_addr, full_kern_args)
-        kexec_prep = ("kexec -l /opt/ipa-wakeup"
+        kexec_prep = ("kexec -l "
+                      + CONF.wakeup.wakeup_target_dir
                       + "/ironic-python-agent.kernel --initrd="
-                      + "/opt/ipa-wakeup"
+                      + CONF.wakeup.wakeup_target_dir
                       + "/ironic-python-agent.initramfs --command-line='"
                       + full_kern_args + "'")
         self._ssh_sudo_execute(kexec_prep, key_file, ssh_user, ssh_addr)
@@ -99,7 +101,7 @@ class SSHWakeup(base.BootInterface):
                                       ssh_addr)
 
     def clean_up_ramdisk(self, task):
-        key_file = '/tmp/' + task.node.uuid + '.priv'
+        key_file = CONF.wakeup.wakeup_tmp_dir + '/' + task.node.uuid + '.priv'
         try:
             os.remove(key_file)
         except FileNotFoundError:
