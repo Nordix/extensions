@@ -115,6 +115,13 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
         # file system label used to find the boot partition
         # if can't be found the plugin falls back on /boot on root partition
         self.boot_label = APARAMS.get('ipa-disk-boot-label', DEF_BOOT_FS_LABEL)
+        # Allow detecting multiple disks with the same partition label.
+        # If present the same partition label will be tolerated on multiple
+        # block device. Useful for environments where the  SCSI and/or FCOE
+        # multipath configurations present the same disk multiple times.
+        # The first block device found to be matching the label will be picked
+        # for processing.
+        self.multi_part_label = APARAMS.get('ipa-multi-part-label')
 
     def get_deploy_steps(self, node, ports):
         custom_reboot_enabled = True
@@ -303,9 +310,12 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
             return None
 
         elif len(output_lines) > 1:
-            raise exception.InstanceDeployFailure(
-                f"More than one file system with label '{label}' "
-                f"exists on device {device_path}, found these: {output_lines}.")
+            comm_msg = (f"More than one file system with label '{label}' "
+                        f"exists on device {device_path}, found: {output_lines}.")
+            if self.multi_part_label is not None:
+                LOG.debug(f"{comm_msg}\n {output_lines[0]} will be selected.")
+            else:
+                raise exception.InstanceDeployFailure(f"{comm_msg}")
         LOG.debug(f"Found separate boot partition: {output_lines}")
         return output_lines[0].strip()
 
