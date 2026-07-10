@@ -20,15 +20,14 @@ from enum import Enum
 import os
 import subprocess
 
-from ironic_lib import utils
-from ironic_lib import exception
 from oslo_config import cfg
 from oslo_log import log
 from oslo_utils import excutils
 
+from ironic_python_agent import errors
 from ironic_python_agent import disk_utils
 from ironic_python_agent import hardware
-from ironic_python_agent import utils as agent_utils
+from ironic_python_agent import utils
 from ironic_python_agent.hardware_managers import luks_tpm
 from ironic_python_agent.hardware_managers.luks import luks_utils as luks
 from ironic_python_agent.hardware_managers.tpm import tpm_utils as tpm
@@ -71,7 +70,7 @@ class GrubUpdateParamSrc(str, Enum):
 
 LOG = log.getLogger()
 CONF = cfg.CONF
-APARAMS = agent_utils.get_agent_params()
+APARAMS = utils.get_agent_params()
 
 # IPA kernel parameter prefixes
 KEXEC_PREFIX = "kxc."
@@ -300,7 +299,7 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
         except Exception as e:
             msg = (f"Failed to retrieve file system labels on {device_path}. "
                    f"Error: {e}")
-            raise exception.InstanceDeployFailure(msg)
+            raise errors.DeploymentError(msg)
 
         if output is None or len(output) == 0:
             return None
@@ -315,7 +314,7 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
             if self.multi_part_label is not None:
                 LOG.debug(f"{comm_msg}\n {output_lines[0]} will be selected.")
             else:
-                raise exception.InstanceDeployFailure(f"{comm_msg}")
+                raise errors.DeploymentError(f"{comm_msg}")
         LOG.debug(f"Found separate boot partition: {output_lines}")
         return output_lines[0].strip()
 
