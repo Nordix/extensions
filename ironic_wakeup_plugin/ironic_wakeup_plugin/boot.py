@@ -24,7 +24,7 @@ from oslo_log import log as logging
 from ironic.common import exception
 from ironic.common import utils
 from ironic.common.i18n import _
-# from ironic.conductor import utils as manager_utils
+from ironic.conductor import utils as manager_utils
 from ironic.conf import CONF
 from ironic.drivers import base
 from ironic.drivers import utils as driver_utils
@@ -71,14 +71,32 @@ class SSHWakeup(base.BootInterface):
                   ssh_user, ssh_addr)
 
     def prepare_ramdisk(self, task, ramdisk_params):
+        # Token management follows the same logic as the virtual-media boot
+        # interface.
         LOG.debug('Starting wakeup ramdisk preparation')
         driver_info = task.node.driver_info or {}
+        bmc_default_kernel_params = ""
+        driver_name = task.node.driver
+        # based on the "parent driver" different defaults are used
+        if driver_name == 'redfish-wakeup':
+            bmc_default_kernel_params = CONF.redfish.kernel_append_params
+        elif driver_name == 'ipmi-wakeup':
+            bmc_default_kernel_params = CONF.pxe.kernel_append_params
         ssh_key = driver_info.get('wakeup_ssh_key')
         ssh_addr = driver_info.get('wakeup_ssh_addr')
         ssh_user = driver_info.get('wakeup_ssh_user')
+        # kernel_params only contains whatever paramters the user set
+        # for a specific node or empty string by default
         kernel_params = driver_utils.get_kernel_append_params(
-            task.node, default=CONF.redfish.kernel_append_params)
+            task.node, default=bmc_default_kernel_params)
+        # agent_options will containis global configuration from env vars and
+        # the config file and other autogenarated paramters like the token
         agent_options = build_agent_options(task.node)
+        manager_utils.add_secret_token(task.node, pregenerated=True)
+        task.node.del_driver_internal_info('agent_verify_ca')
+        task.node.save()
+        agent_options['ipa-agent-token'] = \
+            task.node.driver_internal_info['agent_secret_token']
         full_kern_args = kernel_params
         for key, value in agent_options.items():
             full_kern_args = full_kern_args + f" {key}={value}"
@@ -87,7 +105,6 @@ class SSHWakeup(base.BootInterface):
             f.write(ssh_key)
             f.write("\n")
         os.chmod(key_file, 0o600)
-        # token = manager_utils.add_secret_token(task.node, pregenerated=True)
         LOG.debug('Initiate wakeup for user:%s address:%s kernel-args: [ %s ]',
                   ssh_user, ssh_addr, full_kern_args)
         kexec_prep = ("kexec -l "
