@@ -81,6 +81,7 @@ ROOT_DISK_LINK = "/tmp/root_disk"
 CONFIG_DRIVE_PART_MAPPED = "/dev/mapper/config-2"
 CONFIG_DRIVE_PART_LABELLED = "/dev/disk/by-label/config-2"
 DEF_BOOT_FS_LABEL = "boot"
+DEF_REBOOT_DELAY = 10
 # Will be generated/mounted/binded by the plugin
 ROOT_PARTITION_MOUNT_TARGET = "/run/nextroot"
 ROOT_PARTITION_MAP_TARGET = "/dev/mapper/root_a"
@@ -121,6 +122,18 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
         # The first block device found to be matching the label will be picked
         # for processing.
         self.multi_part_label = APARAMS.get('ipa-multi-part-label')
+        # delay in seconds before the reboot is initiated, default and the
+        # minimum is 10 seconds, if given a value smaller than 10, the logic
+        # will fall back to the default value
+        try:
+            self.reboot_delay = int(APARAMS.get('ipa-reboot-delay', DEF_REBOOT_DELAY))
+        except (TypeError, ValueError):
+            LOG.warning("Invalid ipa-reboot-delay, falling back to 10s")
+            self.reboot_delay = DEF_REBOOT_DELAY
+        if self.reboot_delay < DEF_REBOOT_DELAY:
+            LOG.warning("Reboot delay can't be smaller than 10 seconds! "
+                        "Falling back to use 10 seconds delay!")
+            self.reboot_delay = DEF_REBOOT_DELAY
 
     def get_deploy_steps(self, node, ports):
         custom_reboot_enabled = True
@@ -242,7 +255,7 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
         sudo mount -t cgroup2 none {ROOT_PARTITION_MOUNT_TARGET}/sys/fs/cgroup
         {grub_cmd}
 
-        sleep 10
+        sleep {self.reboot_delay}
         kexec -l {BOOT_PARTITION_MOUNT_TARGET}/vmlinuz --initrd={BOOT_PARTITION_MOUNT_TARGET}/initrd --command-line="{cmdl}"
         systemctl kexec
         """
@@ -259,7 +272,7 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
         sudo mount -t cgroup2 none {ROOT_PARTITION_MOUNT_TARGET}/sys/fs/cgroup
         {grub_cmd}
 
-        sleep 10
+        sleep {self.reboot_delay}
         sudo udevadm settle
         sudo chroot {ROOT_PARTITION_MOUNT_TARGET} systemctl mask grub-boot-success.service
         sudo udevadm settle
