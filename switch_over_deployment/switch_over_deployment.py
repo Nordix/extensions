@@ -23,6 +23,7 @@ import subprocess
 from oslo_config import cfg
 from oslo_log import log
 from oslo_utils import excutils
+from oslo_utils import strutils
 
 from ironic_python_agent import errors
 from ironic_python_agent import disk_utils
@@ -96,6 +97,14 @@ FALLBACK_BOOT_DIR = f"{ROOT_PARTITION_MOUNT_TARGET}/boot"
 
 class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
 
+    def __init__(self):
+        super().__init__()
+        self.boot_part = None
+        self.root_part_mnt_source = ""
+        self.root_part_mnt_target = ""
+        self.conf_drive_mnt_source = ""
+        self.conf_drive_mnt_target = ""
+
     def evaluate_hardware_support(self):
         """The only mandatory function that makes the class visible to the API
 
@@ -110,7 +119,12 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
                                                 KexecParamSrc.DEFAULT)
         # if none the IPA kernel version == disk image kernel version
         self.kexec_kern_version = APARAMS.get('ipa-kexec-kern-ver')
-        # execute grub config update or not
+        # User can skip mounting the root fs from the root disk before
+        # rebooting, but this option is only allowed if kexec is used in
+        # overwrite mode without any grub operations
+        self.mount_root_fs = strutils.bool_from_string(
+            APARAMS.get('ipa-reboot-mnt-root-fs', True))
+        # grub config update mode: 'overwrite' or 'append'; unset disables it
         self.grub_update = APARAMS.get('ipa-grub-update')
         # file system label used to find the boot partition
         # if can't be found the plugin falls back on /boot on root partition
@@ -121,7 +135,10 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
         # multipath configurations present the same disk multiple times.
         # The first block device found to be matching the label will be picked
         # for processing.
-        self.multi_part_label = APARAMS.get('ipa-multi-part-label')
+        # kernel cmdline values are strings; bool_from_string maps
+        # "1"/"true"/"yes"/"on" to True and anything else to False
+        self.multi_part_label = strutils.bool_from_string(
+            APARAMS.get('ipa-multi-part-label', False))
         # delay in seconds before the reboot is initiated, default and the
         # minimum is 10 seconds, if given a value smaller than 10, the logic
         # will fall back to the default value
@@ -203,7 +220,7 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
                 else:
                     f.write(line)
 
-    def prepare_generic_mounts(self, root_disk, boot_part):
+    def prepare_generic_mount_target_dirs(self, root_disk):
         disk_utils.wait_for_disk_to_become_available(root_disk)
         efi_part = disk_utils.find_efi_partition(root_disk)
         utils.execute('mkdir', ROOT_PARTITION_MOUNT_TARGET)
@@ -212,9 +229,25 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
         utils.execute('mkdir', CONFIG_DRIVE_MOUNT_TARGET)
         utils.execute('mount', efi_part['path'], EFI_PARTITION_MOUNT_TARGET)
         disk_utils.wait_for_disk_to_become_available(root_disk)
+
+    def discover_and_mount_boot_part(self, root_disk):
+        boot_part = self.get_partition_by_label(root_disk, self.boot_label)
         if boot_part:
-            utils.execute('mount', boot_part, BOOT_PARTITION_MOUNT_TARGET)
+            LOG.debug("Discovered boot partition, mounting...")
+            try:
+                utils.execute('mount', boot_part, BOOT_PARTITION_MOUNT_TARGET)
+            except Exception:
+                LOG.error("Failed to mount discovered boot partition")
+                boot_part = None
+                disk_utils.wait_for_disk_to_become_available(root_disk)
             disk_utils.wait_for_disk_to_become_available(root_disk)
+        return boot_part
+
+    def mount_fallback_boot_dir(self, root_disk):
+        LOG.debug("Mounting fallback boot directory!")
+        utils.execute('mount', '--bind', FALLBACK_BOOT_DIR,
+                      BOOT_PARTITION_MOUNT_TARGET)
+        disk_utils.wait_for_disk_to_become_available(root_disk)
 
     def run_grub_update(self):
         if not self.grub_update:
@@ -245,14 +278,18 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
         cmdl = f"BOOT_IMAGE=/vmlinuz-{target_kernel_version} "
         cmdl += kexec_params
         grub_cmd = self.run_grub_update()
-
-        return f"""
-        #!/bin/bash
+        # In case of kexec, mounts are only needed for grub customization
+        if grub_cmd:
+            grub_cmd = f"""
         sudo mount --bind /dev {ROOT_PARTITION_MOUNT_TARGET}/dev
         sudo mount --bind /proc {ROOT_PARTITION_MOUNT_TARGET}/proc
         sudo mount --bind /sys {ROOT_PARTITION_MOUNT_TARGET}/sys
         sudo mount --bind /run {ROOT_PARTITION_MOUNT_TARGET}/run
         sudo mount -t cgroup2 none {ROOT_PARTITION_MOUNT_TARGET}/sys/fs/cgroup
+        {grub_cmd}
+        """
+        return f"""
+        #!/bin/bash
         {grub_cmd}
 
         sleep {self.reboot_delay}
@@ -324,7 +361,7 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
         elif len(output_lines) > 1:
             comm_msg = (f"More than one file system with label '{label}' "
                         f"exists on device {device_path}, found: {output_lines}.")
-            if self.multi_part_label is not None:
+            if self.multi_part_label:
                 LOG.debug(f"{comm_msg}\n {output_lines[0]} will be selected.")
             else:
                 raise errors.DeploymentError(f"{comm_msg}")
@@ -345,67 +382,79 @@ class SwitchOverDeploymentHardwareManager(hardware.HardwareManager):
         return switch_cmd
 
     def custom_machine_reboot(self, *args, **kwargs):
+        if self.reboot_mode == Mode.HW:
+            return
         encryption_enabled = CONF.enable_disk_encryption
         real_root_disk = utils.execute('readlink', '-f', ROOT_DISK_LINK)[0]
         real_root_disk = real_root_disk.split('\n')[0]
         disk_utils.wait_for_disk_to_become_available(real_root_disk)
-        boot_part = self.get_partition_by_label(real_root_disk, self.boot_label)
-        self.prepare_generic_mounts(real_root_disk, boot_part)
-        if encryption_enabled:
-            # unlock the partition based on the soft link it should get
-            # automatically device mapped mount the mapped device do the
-            # soft reboot
-            LOG.debug("CUSTOM REBOOT: DECRYPTION STARTING!")
-            try:
-                disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                luks.luks_open_partition(tpm.check_and_generate_key_file(),
-                                         ROOT_PARTITION_LINK, 'root_a')
-                disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                utils.execute('mount', ROOT_PARTITION_MAP_TARGET,
-                              ROOT_PARTITION_MOUNT_TARGET)
-                disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                utils.execute('mount', CONFIG_DRIVE_PART_MAPPED,
-                              CONFIG_DRIVE_MOUNT_TARGET)
-                disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                if not boot_part:
-                    utils.execute('mount', '--bind', FALLBACK_BOOT_DIR,
-                                  BOOT_PARTITION_MOUNT_TARGET)
-                disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                switch_cmd = self.render_reboot_script()
-                disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                LOG.debug("CUSTOM REBOOT: STARTING!")
-                subprocess.Popen(switch_cmd, shell=True,
-                                 stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL,
-                                 preexec_fn=os.setsid, close_fds=True)
-            except Exception:
-                with excutils.save_and_reraise_exception():
-                    LOG.error("ERROR: Can't switch to %(partition)s",
-                              {'partition': ROOT_PARTITION_LINK})
+        self.prepare_generic_mount_target_dirs(real_root_disk)
+        # Kexec with overwrite and without GRUB update doesn't need root fs
+        if (not self.grub_update
+                and self.reboot_mode == Mode.KEXEC
+                and self.kexec_kern_param_src == KexecParamSrc.OVERWRITE):
+            LOG.debug("CUSTOM REBOOT: Skipping root fs mount is allowed!")
         else:
+            LOG.debug("CUSTOM REBOOT: Skipping root fs mount is NOT allowed!")
+            self.mount_root_fs = True
+        LOG.debug(f"CUSTOM REBOOT: Root fs mount status: {self.mount_root_fs}!")
+        if self.mount_root_fs:
+            LOG.debug("CUSTOM REBOOT: MOUNTING ROOT FS!")
             try:
-                LOG.debug("CUSTOM REBOOT: STARTING!")
+                if encryption_enabled:
+                    # unlock the partition based on the soft link it should get
+                    # automatically device mapped mount the mapped device do the
+                    # soft reboot
+                    LOG.debug("CUSTOM REBOOT: DECRYPTION STARTING!")
+                    # Unlock and mount root fs
+                    disk_utils.wait_for_disk_to_become_available(real_root_disk)
+                    luks.luks_open_partition(tpm.check_and_generate_key_file(),
+                                             ROOT_PARTITION_LINK, 'root_a')
+                    self.root_part_mnt_source = ROOT_PARTITION_MAP_TARGET
+                    self.root_part_mnt_target = ROOT_PARTITION_MOUNT_TARGET
+                    self.conf_drive_mnt_source = CONFIG_DRIVE_PART_MAPPED
+                    self.conf_drive_mnt_target = CONFIG_DRIVE_MOUNT_TARGET
+                else:
+                    # Mount root fs
+                    disk_utils.wait_for_disk_to_become_available(real_root_disk)
+                    root_part_info = \
+                        luks_tpm.detect_root_partition_on_device(real_root_disk)
+                    disk_utils.wait_for_disk_to_become_available(real_root_disk)
+                    self.root_part_mnt_source = root_part_info['partition_path']
+                    self.root_part_mnt_target = ROOT_PARTITION_MOUNT_TARGET
+                    self.conf_drive_mnt_source = CONFIG_DRIVE_PART_LABELLED
+                    self.conf_drive_mnt_target = CONFIG_DRIVE_MOUNT_TARGET
+
                 disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                root_part_info = \
-                    luks_tpm.detect_root_partition_on_device(real_root_disk)
+                utils.execute('mount', self.root_part_mnt_source,
+                              self.root_part_mnt_target)
                 disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                utils.execute('mount', root_part_info['partition_path'],
-                              ROOT_PARTITION_MOUNT_TARGET)
+                utils.execute('mount', self.conf_drive_mnt_source,
+                              self.conf_drive_mnt_target)
                 disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                utils.execute('mount', CONFIG_DRIVE_PART_LABELLED,
-                              CONFIG_DRIVE_MOUNT_TARGET)
-                disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                if not boot_part:
-                    utils.execute('mount', '--bind', FALLBACK_BOOT_DIR,
-                                  BOOT_PARTITION_MOUNT_TARGET)
-                disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                switch_cmd = self.render_reboot_script()
-                disk_utils.wait_for_disk_to_become_available(real_root_disk)
-                subprocess.Popen(switch_cmd, shell=True,
-                                 stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL,
-                                 preexec_fn=os.setsid, close_fds=True)
+
             except Exception:
                 with excutils.save_and_reraise_exception():
-                    LOG.error("ERROR: Can't switch to %(partition)s",
+                    LOG.error("ERROR: Can't mount %(partition)s",
                               {'partition': ROOT_PARTITION_LINK})
+        try:
+            # Fallback boot directory can be found on the root fs that is why
+            # boot dir mounting is done here
+            if not self.discover_and_mount_boot_part(real_root_disk):
+                self.mount_fallback_boot_dir(real_root_disk)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error("ERROR: Can't mount boot directory for custom reboot!")
+        try:
+            # Render boot script
+            switch_cmd = self.render_reboot_script()
+            # Run custom reboot script
+            disk_utils.wait_for_disk_to_become_available(real_root_disk)
+            LOG.debug("CUSTOM REBOOT: STARTING!")
+            subprocess.Popen(switch_cmd, shell=True,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             preexec_fn=os.setsid, close_fds=True)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error("ERROR: Can't initiate custom reboot process on IPA")
